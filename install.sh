@@ -3,7 +3,7 @@
 
 REPO_URL="https://github.com/Lacasx1/mbpro.git"
 REPO_BRANCH="main"
-CMD_NAME="mpro"
+CMD_NAME="mbpro"
 TOTAL_STEPS=7
 
 CURRENT_STEP=0
@@ -107,6 +107,7 @@ fi
 if [ -f "menu.sh" ]; then
     cp -f menu.sh /opt/mpro/menu
     chmod +x /opt/mpro/menu
+    ln -sf /opt/mpro/menu "/usr/local/bin/${CMD_NAME}"
     ln -sf /opt/mpro/menu /usr/local/bin/mpro
 fi
 
@@ -121,5 +122,5 @@ rm -rf /tmp/Mpro_build
 
 # --- Etapa 7 ---
 log_success "Instalação concluída com sucesso!"
-echo -e "Use o comando ${YELLOW}mpro${NC} para abrir o menu."
+echo -e "Use o comando ${YELLOW}${CMD_NAME}${NC} para abrir o menu."
 echo -e "--------------------------------------------------------------"

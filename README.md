@@ -32,7 +32,8 @@ chmod +x install.sh
 ## Uso
 
 ```bash
-mpro    # Menu interativo
+mbpro   # Abrir o menu interativo do proxy
+mpro    # Alias compatível
 ```
 
 ### Menu v2.0
