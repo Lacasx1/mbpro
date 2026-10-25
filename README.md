@@ -38,7 +38,7 @@ mpro    # Alias compatível
 
 ### Proxy WebSocket na porta 8080
 
-O binário principal atende o modo HTTP Security sem exigir upgrade WebSocket. Ele lê o cabeçalho HTTP até o fim, preserva dados adicionais e responde uma única vez com `HTTP/1.1 101 <status>` antes de abrir o túnel TCP. Por padrão, os dados seguem para SSH local (`127.0.0.1:22`); para VPN local (`127.0.0.1:1194`), use `/vpn` ou o cabeçalho `X-Mpro-Backend: vpn`. O argumento `-s` (ou `--status`) define o texto após o código 101, por exemplo `-s ws`. Quando HTTPS é habilitado no menu, `-t` ativa TLS no servidor e carrega `/opt/mpro/cert.pem` e `/opt/mpro/key.pem`.
+O binário principal atende HTTP Security sem exigir upgrade WebSocket. Para compatibilidade com o handshake legado do app, responde primeiro `HTTP/1.1 101 <status>`, lê a primeira mensagem do cliente e então envia `HTTP/1.1 200 <status>` antes do túnel TCP. O argumento `-s` (ou `--status`) define o texto usado nas duas respostas, por exemplo `-s ws`. O destino padrão é SSH local (`127.0.0.1:22`); payloads que indicam VPN/1194 selecionam `127.0.0.1:1194`. Dados binários iniciais não são descartados. Quando HTTPS é habilitado no menu, `-t` ativa TLS e carrega `/opt/mpro/cert.pem` e `/opt/mpro/key.pem`.
 
 ### Menu v2.0
 

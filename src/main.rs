@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tls_acceptor = if has_arg("-t") { Some(load_tls_acceptor()?) } else { None };
     let quic_port = get_quic_port();
 
-    println!("[Mpro] Multi-protocolo v2.6.1");
+    println!("[Mpro] Multi-protocolo v2.6.2");
     println!("[HTTP Security{}] Porta: {}", if tls_acceptor.is_some() { "+TLS" } else { "" }, port);
 
     if use_udp {
@@ -78,51 +78,47 @@ async fn handle_http_security<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // HTTP Security não é WebSocket: ler o cabeçalho HTTP até CRLFCRLF sem
-    // exigir Upgrade/Sec-WebSocket-Key e preservar dados enviados junto ao cabeçalho.
-    let mut request = Vec::with_capacity(2048);
-    let mut chunk = [0u8; 1024];
-    let header_end = loop {
-        if let Some(pos) = find_header_end(&request) {
-            break pos;
-        }
-        if request.len() >= 16 * 1024 {
-            return Err("Cabeçalho HTTP maior que 16 KiB".into());
-        }
-        let n = timeout(Duration::from_secs(10), client.read(&mut chunk)).await??;
-        if n == 0 {
-            return Ok(());
-        }
-        request.extend_from_slice(&chunk[..n]);
-    };
+    // Compatibilidade com o handshake HTTP Security legado deste projeto:
+    // responde 101, lê o primeiro payload do cliente e então envia o 200 final.
+    // Não exige Sec-WebSocket-Key/Upgrade; alguns clientes dependem das duas
+    // respostas em etapas para iniciar o túnel.
+    let reason = safe_reason_phrase(status);
+    client
+        .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", reason).as_bytes())
+        .await?;
+    client.flush().await?;
 
-    let header = String::from_utf8_lossy(&request[..header_end]);
-    let lowered = header.to_ascii_lowercase();
-    let backend_port = if lowered.contains("x-mpro-backend: vpn")
-        || lowered.contains("/vpn")
-        || lowered.contains("1194")
-    {
+    let mut initial = [0u8; 8192];
+    let initial_len = timeout(Duration::from_secs(10), client.read(&mut initial)).await??;
+    if initial_len == 0 {
+        return Ok(());
+    }
+    let initial_text = String::from_utf8_lossy(&initial[..initial_len]).to_ascii_lowercase();
+    let backend_port = if initial_text.contains("vpn") || initial_text.contains("1194") {
         1194
     } else {
         22
     };
+
+    client
+        .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", reason).as_bytes())
+        .await?;
+    client.flush().await?;
+
     let mut backend = timeout(
         Duration::from_secs(5),
         TcpStream::connect(("127.0.0.1", backend_port)),
     )
     .await??;
 
-    // Manter o texto configurado no menu (ex.: "ws") como reason phrase,
-    // mas enviar apenas uma resposta HTTP; nunca concatenar um segundo 200.
-    let reason = safe_reason_phrase(status);
-    let response = format!("HTTP/1.1 101 {}\r\n\r\n", reason);
-    client.write_all(response.as_bytes()).await?;
-    client.flush().await?;
-
-    // Se o app enviou dados após o fim do cabeçalho no mesmo pacote, não os perde.
-    let body_start = header_end + 4;
-    if request.len() > body_start {
-        backend.write_all(&request[body_start..]).await?;
+    // O handshake HTTP inicial é de controle. Se o primeiro payload já for
+    // binário/túnel (não um método HTTP), encaminha-o em vez de descartá-lo.
+    let first_line = initial_text.lines().next().unwrap_or("");
+    let is_http_control = ["get ", "post ", "connect ", "head ", "put ", "options ", "patch "]
+        .iter()
+        .any(|method| first_line.starts_with(method));
+    if !is_http_control {
+        backend.write_all(&initial[..initial_len]).await?;
     }
 
     let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -131,10 +127,6 @@ where
     let backend_to_client = tokio::io::copy(&mut backend_read, &mut client_write);
     let _ = tokio::join!(client_to_backend, backend_to_client);
     Ok(())
-}
-
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    data.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
 fn safe_reason_phrase(value: &str) -> String {
