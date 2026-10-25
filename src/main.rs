@@ -1,17 +1,12 @@
 use std::env;
 use std::fs::File;
 use std::io::{BufReader, Error};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::{timeout, Duration};
 use tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig};
 use tokio_rustls::TlsAcceptor;
-use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-use tokio_tungstenite::tungstenite::http::header::HeaderValue;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::accept_hdr_async;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -22,8 +17,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tls_acceptor = if has_arg("-t") { Some(load_tls_acceptor()?) } else { None };
     let quic_port = get_quic_port();
 
-    println!("[Mpro] Multi-protocolo v2.6.0");
-    println!("[TCP/WebSocket{}] Porta: {}", if tls_acceptor.is_some() { "+TLS" } else { "" }, port);
+    println!("[Mpro] Multi-protocolo v2.6.1");
+    println!("[HTTP Security{}] Porta: {}", if tls_acceptor.is_some() { "+TLS" } else { "" }, port);
 
     if use_udp {
         println!("[UDP] Habilitado na porta: {}", port);
@@ -40,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let listener = TcpListener::bind(format!("[::]:{}", port)).await?;
-    println!("Aguardando conexões WebSocket em {}...", port);
+    println!("Aguardando conexões HTTP Security em {}...", port);
     start_http(listener, status, tls_acceptor).await;
     Ok(())
 }
@@ -54,94 +49,113 @@ async fn start_http(listener: TcpListener, status: String, tls_acceptor: Option<
                 let tls_acceptor = tls_acceptor.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_client(client_stream, &status, tls_acceptor).await {
-                        eprintln!("[TCP] Cliente {} desconectado: {}", addr, e);
+                        eprintln!("[HTTP] Cliente {} desconectado: {}", addr, e);
                     }
                 });
             }
-            Err(e) => eprintln!("[TCP] Erro ao aceitar conexão: {}", e),
+            Err(e) => eprintln!("[HTTP] Erro ao aceitar conexão: {}", e),
         }
     }
 }
 
-async fn handle_client(client_stream: TcpStream, status: &str, tls_acceptor: Option<TlsAcceptor>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_client(
+    client_stream: TcpStream,
+    status: &str,
+    tls_acceptor: Option<TlsAcceptor>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(acceptor) = tls_acceptor {
         let tls_stream = acceptor.accept(client_stream).await?;
-        handle_websocket(tls_stream, status).await
+        handle_http_security(tls_stream, status).await
     } else {
-        handle_websocket(client_stream, status).await
+        handle_http_security(client_stream, status).await
     }
 }
 
-async fn handle_websocket<S>(client_stream: S, status: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+async fn handle_http_security<S>(
+    mut client: S,
+    status: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // O handler de upgrade envia exatamente uma resposta 101 válida. O texto de -s
-    // vai em X-Mpro-Status; não é usado como motivo HTTP nem seguido por um 200.
-    let selected_port = Arc::new(Mutex::new(22_u16));
-    let selected_port_for_callback = selected_port.clone();
-    let status_header = HeaderValue::from_str(status)
-        .unwrap_or_else(|_| HeaderValue::from_static("Mpro"));
-
-    let websocket = accept_hdr_async(client_stream, move |request: &Request, mut response: Response| {
-        let backend = request.headers().get("x-mpro-backend")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_else(|| request.uri().path());
-        let port = if backend.to_ascii_lowercase().contains("vpn")
-            || backend.contains("1194") {
-            1194
-        } else {
-            22
-        };
-        if let Ok(mut selected) = selected_port_for_callback.lock() {
-            *selected = port;
+    // HTTP Security não é WebSocket: ler o cabeçalho HTTP até CRLFCRLF sem
+    // exigir Upgrade/Sec-WebSocket-Key e preservar dados enviados junto ao cabeçalho.
+    let mut request = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 1024];
+    let header_end = loop {
+        if let Some(pos) = find_header_end(&request) {
+            break pos;
         }
-        response.headers_mut().insert("X-Mpro-Status", status_header.clone());
-        Ok(response)
-    }).await?;
-
-    let backend_port = selected_port.lock().map(|p| *p).unwrap_or(22);
-    let mut backend = timeout(Duration::from_secs(5), TcpStream::connect(("127.0.0.1", backend_port))).await??;
-    println!("[WS] Upgrade concluído; túnel para 127.0.0.1:{}", backend_port);
-
-    let (mut ws_sink, mut ws_stream) = websocket.split();
-    let (mut backend_read, mut backend_write) = backend.split();
-    let mut buffer = [0_u8; 8192];
-
-    loop {
-        tokio::select! {
-            ws_message = ws_stream.next() => {
-                match ws_message {
-                    Some(Ok(Message::Binary(data))) => backend_write.write_all(&data).await?,
-                    Some(Ok(Message::Text(data))) => backend_write.write_all(data.as_bytes()).await?,
-                    Some(Ok(Message::Ping(data))) => ws_sink.send(Message::Pong(data)).await?,
-                    Some(Ok(Message::Pong(_))) => {},
-                    Some(Ok(Message::Close(frame))) => {
-                        let _ = ws_sink.send(Message::Close(frame)).await;
-                        break;
-                    },
-                    Some(Ok(_)) => {},
-                    Some(Err(e)) => return Err(Box::new(e)),
-                    None => break,
-                }
-            }
-            read_result = backend_read.read(&mut buffer) => {
-                let n = read_result?;
-                if n == 0 {
-                    let _ = ws_sink.send(Message::Close(None)).await;
-                    break;
-                }
-                ws_sink.send(Message::Binary(buffer[..n].to_vec())).await?;
-            }
+        if request.len() >= 16 * 1024 {
+            return Err("Cabeçalho HTTP maior que 16 KiB".into());
         }
+        let n = timeout(Duration::from_secs(10), client.read(&mut chunk)).await??;
+        if n == 0 {
+            return Ok(());
+        }
+        request.extend_from_slice(&chunk[..n]);
+    };
+
+    let header = String::from_utf8_lossy(&request[..header_end]);
+    let lowered = header.to_ascii_lowercase();
+    let backend_port = if lowered.contains("x-mpro-backend: vpn")
+        || lowered.contains("/vpn")
+        || lowered.contains("1194")
+    {
+        1194
+    } else {
+        22
+    };
+    let mut backend = timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(("127.0.0.1", backend_port)),
+    )
+    .await??;
+
+    // Manter o texto configurado no menu (ex.: "ws") como reason phrase,
+    // mas enviar apenas uma resposta HTTP; nunca concatenar um segundo 200.
+    let reason = safe_reason_phrase(status);
+    let response = format!("HTTP/1.1 101 {}\r\n\r\n", reason);
+    client.write_all(response.as_bytes()).await?;
+    client.flush().await?;
+
+    // Se o app enviou dados após o fim do cabeçalho no mesmo pacote, não os perde.
+    let body_start = header_end + 4;
+    if request.len() > body_start {
+        backend.write_all(&request[body_start..]).await?;
     }
+
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    let (mut backend_read, mut backend_write) = backend.into_split();
+    let client_to_backend = tokio::io::copy(&mut client_read, &mut backend_write);
+    let backend_to_client = tokio::io::copy(&mut backend_read, &mut client_write);
+    let _ = tokio::join!(client_to_backend, backend_to_client);
     Ok(())
+}
+
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn safe_reason_phrase(value: &str) -> String {
+    let filtered: String = value
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(64)
+        .collect();
+    if filtered.trim().is_empty() {
+        "Mpro".to_string()
+    } else {
+        filtered.trim().to_string()
+    }
 }
 
 fn load_tls_acceptor() -> Result<TlsAcceptor, Box<dyn std::error::Error + Send + Sync>> {
     let mut cert_reader = BufReader::new(File::open("/opt/mpro/cert.pem")?);
     let certificates = rustls_pemfile::certs(&mut cert_reader)?
-        .into_iter().map(Certificate).collect();
+        .into_iter()
+        .map(Certificate)
+        .collect();
 
     let mut key_reader = BufReader::new(File::open("/opt/mpro/key.pem")?);
     let mut keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader)?;
@@ -149,7 +163,10 @@ fn load_tls_acceptor() -> Result<TlsAcceptor, Box<dyn std::error::Error + Send +
         let mut key_reader = BufReader::new(File::open("/opt/mpro/key.pem")?);
         keys = rustls_pemfile::rsa_private_keys(&mut key_reader)?;
     }
-    let key = keys.into_iter().next().ok_or("Nenhuma chave privada válida em /opt/mpro/key.pem")?;
+    let key = keys
+        .into_iter()
+        .next()
+        .ok_or("Nenhuma chave privada válida em /opt/mpro/key.pem")?;
 
     let config = ServerConfig::builder()
         .with_safe_defaults()

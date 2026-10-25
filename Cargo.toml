@@ -1,6 +1,6 @@
 [package]
 name = "mpro"
-version = "2.6.0"
+version = "2.6.1"
 edition = "2021"
 
 [dependencies]
@@ -18,7 +18,6 @@ bytes = "1"
 quinn = "0.10"
 rustls-native-certs = "0.6"
 futures-util = "0.3"
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["handshake"] }
 tun = "0.6"
 etherparse = "0.13"
 net2 = "0.2"
